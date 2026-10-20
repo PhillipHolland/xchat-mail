@@ -136,7 +136,15 @@ class ClassifyTests(unittest.TestCase):
             self.assertNotIn('Hello Mina', card)
             self.assertIn(m.CODE_WITHHELD, card)
             self.assertIn('verification code', card.lower())
-            self.assertNotIn('123456', m.load_cards(state)['cards']['1']['subject'])
+            stored = m.load_cards(state)['cards']['1']
+            self.assertNotIn('subject', stored)
+            self.assertNotIn('from_addr', stored)
+            blob = json.dumps(stored)
+            self.assertNotIn('123456', blob)
+            self.assertNotIn('verification code', blob)
+            self.assertNotIn('noreply@bank.example', blob)
+            self.assertTrue(stored['subject_sha256'])
+            self.assertTrue(stored['from_addr_sha256'])
 
         with tempfile.TemporaryDirectory() as state:
             runner = fakes.Runner()

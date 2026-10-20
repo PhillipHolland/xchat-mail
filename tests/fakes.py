@@ -73,6 +73,14 @@ def mail_req(state, **over):
         'agent_id': 'mail-lead',
     }
     req.update(over)
+    # Tests that call --watch directly opt in by writing watch_until.
+    # A request field must not open the window, so this writes the state file.
+    if req.pop('arm_watch', True) and req.get('op') in ('watch', 'reply'):
+        path = os.path.join(state, 'watch_until')
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write('9999999999')
     return req
 
 

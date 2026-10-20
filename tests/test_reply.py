@@ -1,6 +1,7 @@
 """Reply confirm: yes window, native reply, reply N, and no auto-send."""
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,13 @@ class ReplyTests(unittest.TestCase):
         pending = m.load_pending(self.state)
         self.assertEqual(pending['phase'], 'proposed')
         self.assertEqual(fakes.mode_of(os.path.join(self.state, 'pending.json')), 0o600)
+        self.assertNotIn('to', pending)
+        self.assertNotIn('subject', pending)
+        self.assertEqual(pending['to_sha256'], m._sha('jane@x.com'))
+        with open(os.path.join(self.state, 'pending.json'), encoding='utf-8') as fh:
+            pending_text = fh.read()
+        self.assertNotIn('jane@x.com', pending_text)
+        self.assertNotIn('Hello', pending_text)
         self.assertNotIn(fakes.REPLY_TOKEN, json.dumps(res))
 
     def test_yes_inside_the_window_emits_one_effect(self):
@@ -92,7 +100,7 @@ class ReplyTests(unittest.TestCase):
         self.assertIn(fakes.REPLY_TOKEN, pending_text)
         self.assertNotIn(fakes.REPLY_TOKEN, fakes.tree_text(self.state).replace(pending_text, ''))
 
-    def test_effect_uses_the_address_saved_on_pending(self):
+    def test_rewritten_address_does_not_replace_the_frozen_hash(self):
         proposed, _runner = self.propose(fakes.REPLY_TOKEN)
         book = m.load_cards(self.state)
         book['cards']['1']['from_addr'] = 'casey@example.com'
@@ -101,12 +109,18 @@ class ReplyTests(unittest.TestCase):
         res, runner = self.watch([
             self.answer(proposed, seq='11', mid='yes-freeze', created=1050 * 1000),
         ], now=1050)
-        self.assertEqual(res['phase'], 'approved')
-        self.assertEqual(res['effect']['to'], 'jane@x.com')
-        self.assertEqual(res['effect']['reply_to'], 'msg_1')
+        self.assertNotEqual(res.get('phase'), 'approved')
+        self.assertNotIn('effect', res)
+        self.assertEqual(res['reason'], 'address_mismatch')
         self.assertNotIn('casey@example.com', json.dumps(res))
-        self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
-        self.assertEqual(m.load_pending(self.state)['to'], 'jane@x.com')
+        self.assertNotIn(fakes.REPLY_TOKEN, json.dumps(res))
+        self.assertEqual(runner.calls, [])
+        pending = m.load_pending(self.state)
+        self.assertEqual(pending['to_sha256'], m._sha('jane@x.com'))
+        self.assertNotIn('to', pending)
+        with open(os.path.join(self.state, 'pending.json'), encoding='utf-8') as fh:
+            self.assertNotIn('jane@x.com', fh.read())
+            self.assertNotIn('casey@example.com', fh.read())
 
     def test_yes_at_120_seconds_counts(self):
         proposed, _runner = self.propose()
@@ -336,19 +350,39 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(res['phase'], 'approved')
         self.assertEqual(res['effect']['text'], fakes.REPLY_TOKEN)
 
-    def test_release_lets_the_same_yes_count_again(self):
+    def test_release_records_a_spent_effect_and_does_not_emit_again(self):
         proposed, _runner = self.propose(fakes.REPLY_TOKEN)
-        self.watch([
+        approved, _runner = self.watch([
             self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1050)
+        effect_id = approved['effect']['effect_id']
         released = m.process({'op': 'release_reply', 'state_dir': self.state}, now=1060)
         self.assertEqual(released['action'], 'released')
         self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
-        res, _runner = self.watch([
+        self.assertNotIn('effect', released)
+        self.assertNotIn(fakes.REPLY_TOKEN, json.dumps(released))
+        ledger_path = os.path.join(self.state, 'spent_effects.json')
+        self.assertEqual(fakes.mode_of(ledger_path), 0o600)
+        with open(ledger_path, encoding='utf-8') as fh:
+            ledger = fh.read()
+        self.assertIn(effect_id, ledger)
+        self.assertNotIn(fakes.REPLY_TOKEN, ledger)
+        self.assertNotIn('jane@x.com', ledger)
+        res, runner = self.watch([
             self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1070)
-        self.assertEqual(res['phase'], 'approved')
-        self.assertEqual(res['effect']['text'], fakes.REPLY_TOKEN)
+        self.assertEqual(res['reason'], 'spent')
+        self.assertNotIn('effect', res)
+        self.assertNotEqual(res.get('phase'), 'approved')
+        self.assertNotIn(fakes.REPLY_TOKEN, json.dumps(res))
+        self.assertEqual(runner.calls, [])
+        fresh, fresh_runner = self.watch([
+            self.answer(proposed, text='yes please', seq='12', mid='yes-2', created=1080 * 1000),
+        ], now=1080)
+        self.assertEqual(fresh['phase'], 'approved')
+        self.assertEqual(fresh['effect']['text'], fakes.REPLY_TOKEN)
+        self.assertNotEqual(fresh['effect']['effect_id'], effect_id)
+        self.assertEqual(fresh_runner.texts()[0], '→ Jane Doe ✉️ sent')
         m.process({'op': 'ack_reply', 'state_dir': self.state})
         self.assertIsNone(m.load_pending(self.state))
         self.assertNotIn(fakes.REPLY_TOKEN, fakes.tree_text(self.state))
@@ -485,6 +519,7 @@ class ReplyTests(unittest.TestCase):
         book = m.load_cards(self.state)
         book['cards']['1']['suspicious'] = False
         book['cards']['1']['from_addr'] = ''
+        book['cards']['1'].pop('from_addr_sha256', None)
         m.save_cards(self.state, book)
         res, runner = self.watch([fakes.owner_msg('reply 1 hello', seq='12', mid='e12')])
         self.assertEqual(res['phase'], 'no_address')
@@ -518,10 +553,98 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(res['effect']['message']['to'], 'jane@x.com')
         self.assertEqual(res['effect']['message']['text'], 'See you Friday')
         self.assertEqual(res['effect']['message']['id'], 'msg_1')
+        self.assertNotIn('draft', res['effect']['message'])
         self.assertEqual(runner.texts()[0], '✉️ sent for approval')
         with self.assertRaises(m.MailError) as caught:
             self.watch([fakes.owner_msg('yes')], owner_user_id='sender-1', sender_user_id='sender-1')
         self.assertEqual(caught.exception.code, 'owner_is_sender')
+
+    def test_gmail_id_is_a_draft_for_gmail_boss(self):
+        card = {
+            'email_id': 'gmail_18',
+            'reply_to': 'gmail_18',
+            'from_name': 'Alex',
+            'from_addr': 'alex@x.com',
+        }
+        effect = m.build_effect(card, 'See you Friday', 'agent', 'mail-lead', 'gmail-boss')
+        self.assertEqual(effect['action'], 'handoff_reply')
+        self.assertEqual(effect['agent'], 'gmail-boss')
+        self.assertEqual(effect['message']['id'], 'gmail_18')
+        self.assertIs(effect['message']['draft'], True)
+        self.assertEqual(effect['message']['to'], 'alex@x.com')
+
+        hashed = dict(card, from_addr='')
+        hashed_effect = m.build_effect(hashed, 'See you Friday', 'agent', 'mail-lead', 'gmail-boss')
+        self.assertIs(hashed_effect['message']['draft'], True)
+        self.assertNotIn('to', hashed_effect['message'])
+
+        with self.assertRaises(m.MailError) as caught:
+            m.build_effect(card, 'See you Friday', 'agent', 'mail-lead', '  ')
+        self.assertEqual(caught.exception.code, 'missing_agent')
+
+        other = dict(card, email_id='msg_18', reply_to='msg_18')
+        plain = m.build_effect(other, 'See you Friday', 'agent', 'mail-lead', 'gmail-boss')
+        self.assertEqual(plain['agent'], 'mail-lead')
+        self.assertNotIn('draft', plain['message'])
+
+        own = m.build_effect(card, 'See you Friday', 'own', 'mail-lead', 'gmail-boss')
+        self.assertEqual(own['action'], 'send_email_reply')
+        self.assertEqual(own['reply_to'], 'gmail_18')
+        self.assertNotIn('agent', own)
+        self.assertNotIn('draft', own)
+
+        book = m.load_cards(self.state)
+        book['cards']['1']['email_id'] = 'gmail_18'
+        book['cards']['1']['reply_to'] = 'gmail_18'
+        book['cards']['1']['source'] = 'agent'
+        m.save_cards(self.state, book)
+        proposed, _runner = self.propose()
+        with self.assertRaises(m.MailError) as caught:
+            self.watch([
+                self.answer(proposed, seq='11', mid='yes-g', created=1050 * 1000),
+            ], now=1050, mailSource='agent', gmail_agent_id='')
+        self.assertEqual(caught.exception.code, 'missing_agent')
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+
+        res, runner = self.watch([
+            self.answer(proposed, seq='11', mid='yes-g', created=1050 * 1000),
+        ], now=1050, mailSource='agent', agent_id='mail-lead', gmail_agent_id='gmail-boss')
+        self.assertEqual(res['phase'], 'approved')
+        self.assertEqual(res['effect']['agent'], 'gmail-boss')
+        self.assertEqual(res['effect']['message']['id'], 'gmail_18')
+        self.assertIs(res['effect']['message']['draft'], True)
+        self.assertEqual(res['effect']['message']['text'], 'See you Friday')
+        self.assertEqual(runner.texts()[0], '✉️ sent for approval')
+
+    def test_operator_prompts_name_gmail_boss_sha_and_pause(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'docs', 'OPERATOR.md'), encoding='utf-8') as fh:
+            text = fh.read()
+        with open(os.path.join(root, 'config.example.json'), encoding='utf-8') as fh:
+            example = fh.read()
+        self.assertIn('"gmail_agent_id": ""', example)
+        for phrase in (
+            'only routine text',
+            'gmail_',
+            'Gmail boss',
+            'gmail_agent_id',
+            'draft',
+            'SHA256SUMS',
+            'docs/OPERATOR.md',
+            'watch_until',
+            '1800',
+            'watch_paused',
+            '20 Oct 2026',
+            'pbh-mail',
+            'mail.google.com',
+            'spent_effects.json',
+        ):
+            self.assertIn(phrase, text, phrase)
+        # Prompts stay free of account ids. A uuid or a long digit run does not belong here.
+        self.assertIsNone(re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', text, re.I))
+        self.assertIsNone(re.search(r'\b\d{7,}\b', text))
+        self.assertIsNone(re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', example, re.I))
+        self.assertIsNone(re.search(r'\b\d{7,}\b', example))
 
     def test_reaction_is_not_a_yes_and_fetch_does_not_save_pending(self):
         self.propose()

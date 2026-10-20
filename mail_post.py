@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mail in X Chat v0.1.0 — routine helper (runs on the bot's Linux computer).
+"""Mail in X Chat v0.1.1 — routine helper (runs on the bot's Linux computer).
 
 An email-trigger routine (own mode) or an agent message (agent mode) writes one
 request file and runs this script. The file is deleted as soon as it is read.
@@ -31,8 +31,9 @@ import time
 import uuid
 from email.parser import BytesParser
 from html.parser import HTMLParser
+from urllib.parse import urlsplit, urlunsplit
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 STATE_DIR = '~/.xchat-mail'
 SEP = ' \u00b7 '
 CARD_MARK = '\u2709\ufe0f'
@@ -132,6 +133,17 @@ _DEADLINE = re.compile(
 _BULK_PHRASE = re.compile(
     r'(?i)\b(?:view in (?:your )?browser|view this email|unsubscribe|email preferences|'
     r'manage (?:your )?preferences|%\s*off|limited time|special offer|you(?:\'re| are) receiving this)\b')
+# Weaker than a suspicious hit. These stay off the excerpt, and the card still posts.
+_UNSURE = re.compile(
+    r'(?i)(?:'
+    r'\b(?:ignore|disregard|override|jailbreak|exfiltrat\w*)\b|'
+    r'\b(?:system\s*prompt|developer\s*message|you are now|act as an?|new instructions)\b|'
+    r'\b(?:note to|attention|dear)\s+(?:the\s+)?(?:bot|assistant|ai|model)\b|'
+    r'\bas an?\s+(?:ai|assistant|bot|language model)\b|'
+    r'os\.system|subprocess|eval\(|base64'
+    r')')
+_ODD_CHAR = re.compile(r'[<>`{}\\|]')
+_BIDI = re.compile(r'[\u202a-\u202e\u2066-\u2069]')
 
 
 class MailError(Exception):
@@ -578,6 +590,20 @@ def attachment_names(raw):
 
 
 # ---------- importance (own mode) ----------
+def excerpt_is_clean(text):
+    """True when the excerpt can be shown. Empty text has nothing to hide."""
+    blob = text or ''
+    if not blob.strip():
+        return True
+    if _UNSURE.search(blob) or _ODD_CHAR.search(blob) or _BIDI.search(blob):
+        return False
+    if re.search(r'[A-Za-z]', blob) and re.search(r'[\u0370-\u03FF\u0400-\u04FF]', blob):
+        return False
+    if re.search(r'\b[A-Za-z0-9+/]{40,}={0,2}\b', blob):
+        return False
+    return True
+
+
 def suspicious_reason(text):
     blob = _squash_ws(text or '')
     blob = re.sub(r'\s+', ' ', blob)
@@ -786,20 +812,38 @@ def render_card(name, subject, lines, files, open_link, suspicious, reason):
     return '\n'.join(parts)
 
 
+# Open links are agent-supplied. Only these hosts, and never the query or fragment.
+_OPEN_HOSTS = ('mail.google.com', 'pbh-mail.vercel.app')
+
+
 def safe_open_link(url, source):
     if source != 'agent':
         return None
     if not isinstance(url, str):
         return None
     url = url.strip()
-    if len(url) > 500 or not re.match(r'https?://[^\s]+$', url):
+    if not url or len(url) > 500 or re.search(r'\s', url):
         return None
-    return url
+    parts = urlsplit(url)
+    host = (parts.hostname or '').lower().rstrip('.')
+    if parts.scheme.lower() != 'https' or host not in _OPEN_HOSTS:
+        return None
+    if parts.username or parts.password or parts.port not in (None, 443):
+        return None
+    path = parts.path or ''
+    if path.startswith('//') or '\\' in path:
+        return None
+    cleaned = urlunsplit(('https', host, path, '', ''))
+    if len(cleaned) > 500:
+        return None
+    return cleaned
 
 
 def confirm_line(name, addr, text):
     shown = one_line(text, CONFIRM_SHOW_CAP)
-    return 'Reply to %s <%s>: "%s"? Reply yes within 2 min.' % (name, addr, shown)
+    if addr:
+        return 'Reply to %s <%s>: "%s"? Reply yes within 2 min.' % (name, addr, shown)
+    return 'Reply to %s: "%s"? Reply yes within 2 min.' % (name, shown)
 
 
 def sent_line(name, source):
@@ -808,33 +852,73 @@ def sent_line(name, source):
     return '\u2192 %s \u2709\ufe0f sent' % name
 
 
-def build_effect(card, text, source, agent_id):
+def build_effect(card, text, source, agent_id, gmail_agent_id=''):
+    """Own mode sends the reply. Agent mode hands it off.
+
+    An id that starts with gmail_ goes to Gmail boss as a draft the owner sends.
+    Every other id goes to Mail Lead. Own mode ignores the prefix.
+    """
     text = one_line(text, REPLY_TEXT_CAP)
+    addr = card.get('from_addr') or ''
     if source == 'agent':
+        email_id = str(card.get('email_id') or '')
+        agent = agent_id
+        draft = False
+        if email_id.startswith('gmail_'):
+            agent = str(gmail_agent_id or '').strip()
+            if not agent:
+                raise MailError('missing_agent')
+            draft = True
+        message = {
+            'id': card['email_id'],
+            'reply_to': card['reply_to'],
+            'from_name': card['from_name'],
+            'text': text,
+        }
+        if addr:
+            message['to'] = addr
+        if draft:
+            message['draft'] = True
         return {
             'action': 'handoff_reply',
-            'agent': agent_id,
-            'message': {
-                'id': card['email_id'],
-                'reply_to': card['reply_to'],
-                'to': card['from_addr'],
-                'from_name': card['from_name'],
-                'text': text,
-            },
+            'agent': agent,
+            'message': message,
         }
-    return {
+    effect = {
         'action': 'send_email_reply',
         'reply_to': card['reply_to'],
-        'to': card['from_addr'],
         'text': text,
     }
+    if addr:
+        effect['to'] = addr
+    return effect
+
+
+def address_status(card, pending=None):
+    """('plain', addr), ('hash', ''), ('missing', ''), or ('mismatch', '').
+
+    Plaintext is used only when it still matches the hash frozen at confirm.
+    A rewritten card does not become the new recipient.
+    """
+    card = card or {}
+    pending = pending or {}
+    addr = str(card.get('from_addr') or '')
+    stored = str(card.get('from_addr_sha256') or '')
+    want = str(pending.get('to_sha256') or stored)
+    if addr:
+        if want and _sha(addr) != want:
+            return 'mismatch', ''
+        return 'plain', addr
+    if want or stored:
+        return 'hash', ''
+    return 'missing', ''
 
 
 def confirmed_card(card, pending):
-    """Reply to the address saved on pending.json, not a card rewritten later."""
+    """Name and reply id come from the confirm. The address is the hash-checked one."""
     frozen = dict(card)
-    if pending.get('to'):
-        frozen['from_addr'] = pending['to']
+    _status, addr = address_status(card, pending)
+    frozen['from_addr'] = addr
     if pending.get('from_name'):
         frozen['from_name'] = pending['from_name']
     if pending.get('reply_to'):
@@ -849,6 +933,90 @@ def ensure_dir(path):
         os.chmod(path, 0o700)
     except OSError:
         pass
+
+
+_REQUEST_LEFTOVER = re.compile(r'^(?:in|watch)-[^/]+\.json$')
+
+
+def sweep_request_files(state_dir):
+    """Drop leftover request files. The one just read is already gone."""
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return
+    for name in names:
+        if not _REQUEST_LEFTOVER.match(name):
+            continue
+        path = os.path.join(state_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def sweep_juicebox_copy(state_dir):
+    """The juicebox lives under ~/xchat/sender. Do not keep a copy here."""
+    path = os.path.join(state_dir, 'sender-juicebox.json')
+    if os.path.isfile(path) or os.path.islink(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _within(path, root):
+    path = os.path.realpath(os.path.expanduser(path))
+    root = os.path.realpath(os.path.expanduser(root))
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def checked_juicebox(helper, state_dir):
+    """Return the sender juicebox path, or '' when the helper has none.
+
+    A path inside the mail state dir, or outside ~/xchat/sender, is refused.
+    """
+    raw = str((helper or {}).get('juicebox') or '').strip()
+    if not raw:
+        return ''
+    path = os.path.realpath(os.path.expanduser(raw))
+    sender = os.path.expanduser('~/xchat/sender')
+    state = os.path.expanduser(state_dir or STATE_DIR)
+    mail_home = os.path.expanduser(STATE_DIR)
+    if _within(path, state) or _within(path, mail_home) or not _within(path, sender):
+        raise MailError('bad_juicebox')
+    return path
+
+
+def watch_window_open(state, now):
+    """True only when watch_until is a timestamp strictly in the future."""
+    path = os.path.join(state, 'watch_until')
+    try:
+        with open(path, encoding='utf-8') as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return False
+    if not re.fullmatch(r'\d+(?:\.\d+)?', raw):
+        return False
+    try:
+        until = float(raw)
+    except ValueError:
+        return False
+    return until > float(now)
+
+
+def _open_lock(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, 'a+')
 
 
 def atomic_write(path, text):
@@ -906,7 +1074,7 @@ def log_counts(state_dir, **counts):
 class StateLock:
     def __init__(self, directory):
         ensure_dir(directory)
-        self.fh = open(os.path.join(directory, '.lock'), 'a')
+        self.fh = _open_lock(os.path.join(directory, '.lock'))
 
     def __enter__(self):
         fcntl.flock(self.fh, fcntl.LOCK_EX)
@@ -947,7 +1115,8 @@ class Dedupe:
         folder = os.path.dirname(self.path) or '.'
         ensure_dir(folder)
         lock_path = self.path + '.lock'
-        with open(lock_path, 'a') as lk:
+        lk = _open_lock(lock_path)
+        try:
             fcntl.flock(lk, fcntl.LOCK_EX)
             data = self._read()
             now = self.now()
@@ -956,6 +1125,8 @@ class Dedupe:
             cut = now - self.ttl
             data = {k: v for k, v in data.items() if isinstance(v, (int, float)) and v >= cut}
             atomic_write(self.path, json.dumps(data))
+        finally:
+            lk.close()
 
 
 class KeyCache:
@@ -1038,7 +1209,13 @@ def load_pending(state):
 
 
 def save_pending(state, data):
-    atomic_write(_pending_path(state), json.dumps(data))
+    stored = dict(data)
+    addr = str(stored.pop('to', '') or '')
+    if addr and not stored.get('to_sha256'):
+        stored['to_sha256'] = _sha(addr)
+    stored.pop('subject', None)
+    stored.pop('from_addr', None)
+    atomic_write(_pending_path(state), json.dumps(stored))
 
 
 def clear_pending(state):
@@ -1046,6 +1223,54 @@ def clear_pending(state):
         os.remove(_pending_path(state))
     except OSError:
         pass
+
+
+def _spent_path(state):
+    return os.path.join(state, 'spent_effects.json')
+
+
+def load_spent(state):
+    data = read_json(_spent_path(state), {'effects': {}})
+    if not isinstance(data, dict) or not isinstance(data.get('effects'), dict):
+        return {'effects': {}}
+    return data
+
+
+def remember_spent(state, effect_id, yes_keys, now):
+    """A released effect id stays spent. The ledger holds ids only, never the reply."""
+    effect_id = str(effect_id or '').strip()
+    keys = []
+    for key in yes_keys or []:
+        key = str(key or '').strip()
+        if key and key not in keys:
+            keys.append(key)
+    if not effect_id and not keys:
+        return
+    data = load_spent(state)
+    effects = data['effects']
+    ident = effect_id or ('k_' + _sha('|'.join(keys))[:16])
+    effects[ident] = {'yes_keys': keys, 'at': now}
+    if len(effects) > 200:
+        ordered = sorted(
+            effects.items(),
+            key=lambda item: float((item[1] or {}).get('at') or 0) if isinstance(item[1], dict) else 0)
+        effects = dict(ordered[-200:])
+    atomic_write(_spent_path(state), json.dumps({'effects': effects}))
+
+
+def yes_is_spent(state, keys):
+    want = set(str(key) for key in (keys or []) if key)
+    if not want:
+        return False
+    for row in load_spent(state)['effects'].values():
+        if not isinstance(row, dict):
+            continue
+        have = set(str(key) for key in (row.get('yes_keys') or []) if key)
+        if want & have:
+            return True
+        if str(row.get('effect_id') or '') and str(row.get('effect_id')) in want:
+            return True
+    return False
 
 
 def _outbox_path(state):
@@ -1147,16 +1372,18 @@ def locate_helper(helper):
     return None, None
 
 
-def _helper_base(helper):
+def _helper_base(helper, state_dir=None):
     py, script = locate_helper(helper)
     if not py or not script:
         raise MailError('xchat_lite_missing')
     base = [py, script]
     h = helper or {}
-    for flag, key in (('--user-id', 'user_id'), ('--key-version', 'key_version'), ('--juicebox', 'juicebox')):
+    for flag, key in (('--user-id', 'user_id'), ('--key-version', 'key_version')):
         if h.get(key):
-            val = os.path.expanduser(str(h[key])) if key == 'juicebox' else str(h[key])
-            base += [flag, val]
+            base += [flag, str(h[key])]
+    juice = checked_juicebox(h, state_dir)
+    if juice:
+        base += ['--juicebox', juice]
     return base
 
 
@@ -1210,8 +1437,9 @@ def session_encrypt_stdin(conversation_id, text, xchat, reply_to=None, should_no
     return body
 
 
-def encrypt_line(conversation_id, text, xchat, helper, runner, reply_to=None, should_notify=False):
-    base = _helper_base(helper)
+def encrypt_line(conversation_id, text, xchat, helper, runner, reply_to=None, should_notify=False,
+                 state_dir=None):
+    base = _helper_base(helper, state_dir)
     res = _run(base + ['session-encrypt'],
                session_encrypt_stdin(conversation_id, text, xchat, reply_to, should_notify), runner)
     return {
@@ -1225,10 +1453,10 @@ def encrypt_line(conversation_id, text, xchat, helper, runner, reply_to=None, sh
     }
 
 
-def decrypt_events(events, xchat, helper, runner):
+def decrypt_events(events, xchat, helper, runner, state_dir=None):
     if not events:
         return []
-    base = _helper_base(helper)
+    base = _helper_base(helper, state_dir)
     res = _run(base + ['decrypt'], {
         'events': list(events),
         'conversation_key_events': (xchat or {}).get('conversation_key_events') or [],
@@ -1353,11 +1581,18 @@ def build_plaintext(data, source, tag, reason):
         public = _public_reason(reason, data) if tag == 'suspicious' else CODE_WITHHELD
         text = render_card(data['from_name'], data['subject'], [], [], None, True, public)
         return text, public
-    lines = body_lines(data.get('_display') or '')
-    # Final pass: a URL must not survive inside a body line. The subject word still counts.
-    lines = [_strip_urls(mask_codes(line, prefix=data.get('subject') or '')).strip() for line in lines]
-    lines = [line for line in lines if line]
-    text = render_card(data['from_name'], data['subject'], lines, data.get('_files') or [], open_link, False, '')
+    # Sender, subject, and Open are the card. The excerpt is added only when it is clean.
+    display = data.get('_display') or ''
+    if excerpt_is_clean((data.get('subject') or '') + '\n' + display):
+        lines = body_lines(display)
+        # Final pass: a URL must not survive inside a body line. The subject word still counts.
+        lines = [_strip_urls(mask_codes(line, prefix=data.get('subject') or '')).strip() for line in lines]
+        lines = [line for line in lines if line]
+        files = data.get('_files') or []
+    else:
+        lines = []
+        files = []
+    text = render_card(data['from_name'], data['subject'], lines, files, open_link, False, '')
     return text, ''
 
 
@@ -1439,8 +1674,8 @@ def handle_inbound(req, runner, now):
     fields = {
         'email_id': email_id,
         'from_name': data['from_name'],
-        'from_addr': data['from_addr'],
-        'subject': data['subject'],
+        'from_addr_sha256': _sha(data['from_addr']),
+        'subject_sha256': _sha(data['subject']),
         'reply_to': data.get('_reply_to') or email_id,
         'message_id': '',
         'sequence_id': '',
@@ -1449,7 +1684,8 @@ def handle_inbound(req, runner, now):
         'source': source,
     }
     try:
-        send = encrypt_line(conv, text, xchat, req.get('helper'), runner, should_notify=True)
+        send = encrypt_line(conv, text, xchat, req.get('helper'), runner, should_notify=True,
+                            state_dir=state)
     except MailError as err:
         if err.code in ('xchat_lite_failed', 'xchat_lite_missing') and from_cache:
             return _crypto_failure(cache, True, posted_tag)
@@ -1749,7 +1985,7 @@ def bind_cards(cards, messages, sender_id):
 def _fixed_send(req, runner, text, xchat, from_cache, cache, conv, reply_to, kind):
     try:
         send = encrypt_line(conv, text, xchat, req.get('helper'), runner,
-                            reply_to=reply_to, should_notify=True)
+                            reply_to=reply_to, should_notify=True, state_dir=req.get('state_dir'))
     except MailError as err:
         if err.code == 'xchat_lite_missing':
             raise
@@ -1759,6 +1995,8 @@ def _fixed_send(req, runner, text, xchat, from_cache, cache, conv, reply_to, kin
 
 def handle_watch(req, runner, now):
     state = req['state_dir']
+    if not watch_window_open(state, now):
+        return {'action': 'skip', 'reason': 'watch_paused', 'posted_kind': 'watch'}
     owner = str(req.get('owner_user_id') or '').strip()
     sender = str(req.get('sender_user_id') or '').strip()
     conv = str(req.get('conversation_id') or '').strip()
@@ -1793,7 +2031,7 @@ def handle_watch(req, runner, now):
         if events:
             xchat.setdefault('events', list(events))
             try:
-                messages = decrypt_events(events, xchat, req.get('helper'), runner)
+                messages = decrypt_events(events, xchat, req.get('helper'), runner, state_dir=state)
             except MailError as err:
                 if err.code == 'xchat_lite_missing':
                     raise
@@ -1902,12 +2140,16 @@ def handle_watch(req, runner, now):
             clear_pending(state)
             finish_seen()
             return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
-        frozen = confirmed_card(card, pending)
-        if not frozen.get('from_addr'):
+        status, addr = address_status(card, pending)
+        if status == 'mismatch':
+            finish_seen()
+            return {'action': 'skip', 'reason': 'address_mismatch', 'posted_kind': 'watch'}
+        if status == 'missing':
             clear_pending(state)
             finish_seen()
             return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
-        line = confirm_line(frozen['from_name'], frozen['from_addr'], pending.get('text') or '')
+        frozen = confirmed_card(card, pending)
+        line = confirm_line(frozen['from_name'], addr, pending.get('text') or '')
         send, err = _fixed_send(
             req, runner, line, xchat, from_cache, cache, conv,
             thread_of(pending.get('owner_sequence_id')), 'watch')
@@ -1982,8 +2224,22 @@ def handle_watch(req, runner, now):
                 finish_seen()
                 clear_pending(state)
                 return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
+            if yes_is_spent(state, event_keys(row)):
+                # This yes already produced an effect. Releasing it must not mint another.
+                finish_seen()
+                return {'action': 'skip', 'reason': 'spent', 'posted_kind': 'watch'}
+            status, addr = address_status(card, pending)
+            if status == 'mismatch':
+                finish_seen()
+                return {'action': 'skip', 'reason': 'address_mismatch', 'posted_kind': 'watch'}
+            if status == 'missing':
+                finish_seen()
+                clear_pending(state)
+                return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
             frozen = confirmed_card(card, pending)
-            effect = build_effect(frozen, pending.get('text') or '', source, agent_id)
+            effect = build_effect(
+                frozen, pending.get('text') or '', source, agent_id,
+                req.get('gmail_agent_id') or '')
             effect_id = 'e_' + uuid.uuid4().hex[:12]
             effect['effect_id'] = effect_id
             # Encrypt first. A failure must leave the yes unseen and the confirm posted.
@@ -2023,7 +2279,11 @@ def handle_watch(req, runner, now):
             finish_seen()
             return {'action': 'send', 'phase': 'refused', 'sends': [send], 'encrypted': True,
                     'posted_kind': 'watch'}
-        if not card.get('from_addr'):
+        status, addr = address_status(card, None)
+        if status == 'mismatch':
+            finish_seen()
+            return {'action': 'skip', 'reason': 'address_mismatch', 'posted_kind': 'watch'}
+        if status == 'missing':
             send, err = send_fixed(WARN_MARK + ' That message has no reply address.', seq)
             if err:
                 return err
@@ -2031,7 +2291,7 @@ def handle_watch(req, runner, now):
             return {'action': 'send', 'phase': 'no_address', 'sends': [send], 'encrypted': True,
                     'posted_kind': 'watch'}
         reply_text = one_line(intent['text'], REPLY_TEXT_CAP)
-        line = confirm_line(card['from_name'], card['from_addr'], reply_text)
+        line = confirm_line(card['from_name'], addr, reply_text)
         send, err = send_fixed(line, seq)
         if err:
             return err
@@ -2040,7 +2300,7 @@ def handle_watch(req, runner, now):
             'confirm_id': confirm_id,
             'card_n': card['n'],
             'from_name': card['from_name'],
-            'to': card['from_addr'],
+            'to_sha256': _sha(addr) if addr else str(card.get('from_addr_sha256') or ''),
             'reply_to': card['reply_to'],
             'text': reply_text,
             'proposed_at': now,
@@ -2088,6 +2348,7 @@ def release_reply(req, now):
         return {'action': 'skip', 'reason': 'no_pending'}
     confirm_at = float(pending.get('confirm_at') or 0)
     if pending.get('phase') == 'awaiting_ack' and confirm_at and now <= confirm_at + YES_WINDOW_S:
+        remember_spent(state, pending.get('effect_id'), pending.get('yes_keys'), now)
         seen = load_seen_events(state)
         for key in pending.get('yes_keys') or []:
             unsee_event(seen, key)
@@ -2145,7 +2406,6 @@ def list_cards(req):
         rows.append({
             'n': card.get('n'),
             'from_name': card.get('from_name') or '',
-            'subject': card.get('subject') or '',
             'suspicious': bool(card.get('suspicious')),
         })
     return {'action': 'cards', 'cards': rows}
@@ -2167,6 +2427,9 @@ def process(req, runner=None, now=None):
     op = str(req.get('op') or 'inbound').strip().lower()
     state = req['state_dir']
     ensure_dir(state)
+    sweep_request_files(state)
+    sweep_juicebox_copy(state)
+    checked_juicebox(req.get('helper'), state)
     runner = runner or _default_runner(req.get('helper'))
     with StateLock(state):
         if op in ('watch', 'reply'):
@@ -2287,6 +2550,8 @@ def main(argv=None):
 
     if args.forget_keys:
         state = os.path.expanduser(args.state_dir or STATE_DIR)
+        ensure_dir(state)
+        sweep_request_files(state)
         KeyCache(os.path.join(state, 'xchat_keys.json')).clear()
         print(json.dumps({'action': 'forgot_keys'}))
         return 0
@@ -2337,6 +2602,10 @@ def main(argv=None):
         req = _apply_state(req, args.state_dir)
         res = process(req)
     except MailError as err:
+        try:
+            sweep_request_files(os.path.expanduser(args.state_dir or STATE_DIR))
+        except OSError:
+            pass
         res = {'action': 'error', 'reason': err.code}
     except SystemExit:
         raise

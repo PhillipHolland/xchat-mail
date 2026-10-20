@@ -216,6 +216,44 @@ class ModeTests(unittest.TestCase):
             dedupe = m.Dedupe(os.path.join(state, 'seen_ids.json'), now=lambda: 1000)
             self.assertFalse(dedupe.seen('msg_3'))
 
+    def test_inbound_keeps_hashes_and_list_cards_has_no_subject(self):
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, payload=person(
+                'The March invoice is attached. Please pay it by Friday.',
+            )), runner=runner, now=1000)
+            self.assertEqual(res['action'], 'send')
+            stored = m.load_cards(state)['cards']['1']
+            self.assertNotIn('subject', stored)
+            self.assertNotIn('from_addr', stored)
+            self.assertEqual(stored['subject_sha256'], m._sha("Friday's invoice"))
+            self.assertEqual(stored['from_addr_sha256'], m._sha('jane@x.com'))
+            raw = fakes.tree_text(state)
+            self.assertNotIn('jane@x.com', raw)
+            self.assertNotIn("Friday's invoice", raw)
+            self.assertNotIn('March invoice', raw)
+            listed = m.process({'op': 'list_cards', 'state_dir': state})
+            self.assertEqual(listed['cards'], [{
+                'n': 1, 'from_name': 'Jane Doe', 'suspicious': False,
+            }])
+            self.assertNotIn('subject', json.dumps(listed))
+            self.assertNotIn('jane@x.com', json.dumps(listed))
+            reply_runner = fakes.Runner()
+            reply = m.process(fakes.mail_req(state, op='watch', messages=[
+                fakes.owner_msg('reply 1 See you Friday', seq='10', mid='e10'),
+            ]), runner=reply_runner, now=1000)
+            self.assertEqual(reply['phase'], 'confirm')
+            self.assertNotIn('jane@x.com', reply_runner.texts()[0])
+            self.assertIn('Jane Doe', reply_runner.texts()[0])
+            pending_path = os.path.join(state, 'pending.json')
+            with open(pending_path, encoding='utf-8') as fh:
+                pending_raw = fh.read()
+            self.assertNotIn('jane@x.com', pending_raw)
+            self.assertNotIn("Friday's invoice", pending_raw)
+            self.assertNotIn('subject', json.loads(pending_raw))
+            self.assertEqual(json.loads(pending_raw)['to_sha256'], stored['from_addr_sha256'])
+            self.assertIn('See you Friday', pending_raw)
+
     def test_state_files_are_private_and_logs_are_counts(self):
         with tempfile.TemporaryDirectory() as state:
             m.process(fakes.mail_req(state, payload=person(
@@ -233,8 +271,16 @@ class ModeTests(unittest.TestCase):
             blob = json.dumps(listed)
             self.assertNotIn('jane@x.com', blob)
             self.assertNotIn('ZXQ-BODY-TOKEN', blob)
+            self.assertNotIn('invoice', blob.lower())
+            self.assertNotIn('subject', listed['cards'][0])
             self.assertEqual(listed['cards'][0]['from_name'], 'Jane Doe')
-            self.assertIn('invoice', listed['cards'][0]['subject'])
+            stored = m.load_cards(state)['cards']['1']
+            self.assertNotIn('subject', stored)
+            self.assertNotIn('from_addr', stored)
+            self.assertNotIn('invoice', json.dumps(stored).lower())
+            self.assertNotIn('jane@x.com', json.dumps(stored))
+            self.assertEqual(stored['subject_sha256'], m._sha("Friday's invoice"))
+            self.assertEqual(stored['from_addr_sha256'], m._sha('jane@x.com'))
 
     def test_raw_rfc822_extracts_headers_and_not_the_attachment_bytes(self):
         msg = EmailMessage()
@@ -303,7 +349,13 @@ class ModeTests(unittest.TestCase):
             self.assertEqual(again_runner.calls, [])
             self.assertFalse(dedupe.seen('msg_1'))
             card = m.load_cards(state)['cards']['1']
-            self.assertEqual(card['from_addr'], 'jane@x.com')
+            self.assertNotIn('from_addr', card)
+            self.assertNotIn('subject', card)
+            self.assertEqual(card['from_addr_sha256'], m._sha('jane@x.com'))
+            self.assertEqual(card['subject_sha256'], m._sha("Friday's invoice"))
+            self.assertNotIn('casey@example.com', json.dumps(card))
+            self.assertNotIn('Pay Casey', json.dumps(card))
+            self.assertNotIn('jane@x.com', json.dumps(card))
             self.assertNotIn('casey@example.com', json.dumps(again))
             self.assertNotIn('ZXQ-BODY-TOKEN', json.dumps(again))
             self.assertNotIn('ZXQ-BODY-TOKEN', fakes.tree_text(state))
@@ -339,6 +391,132 @@ class ModeTests(unittest.TestCase):
                 from_name='Shop',
             )), runner=fakes.Runner(), now=1000)
             self.assertEqual(res['reason'], 'normal')
+
+    def test_locks_are_private_watch_pauses_and_juicebox_is_not_copied(self):
+        old = os.umask(0)
+        try:
+            with tempfile.TemporaryDirectory() as state:
+                os.chmod(state, 0o700)
+                wide = os.path.join(state, '.lock')
+                fd = os.open(wide, os.O_RDWR | os.O_CREAT, 0o666)
+                os.close(fd)
+                self.assertEqual(fakes.mode_of(wide), 0o666)
+                with m.StateLock(state):
+                    self.assertEqual(fakes.mode_of(wide), 0o600)
+                m.Dedupe(os.path.join(state, 'seen_ids.json'), now=lambda: 1000).commit(['msg_1'])
+                self.assertEqual(fakes.mode_of(os.path.join(state, 'seen_ids.json.lock')), 0o600)
+        finally:
+            os.umask(old)
+
+        with tempfile.TemporaryDirectory() as state:
+            fakes.add_card(state)
+            paused = m.process(fakes.mail_req(
+                state, op='watch', arm_watch=False, watch_until='9999999999', messages=[
+                    fakes.owner_msg('reply 1 See you Friday', seq='10', mid='e10'),
+                ]), runner=fakes.Runner(), now=1000)
+            self.assertEqual(paused, {
+                'action': 'skip', 'reason': 'watch_paused', 'posted_kind': 'watch',
+            })
+            self.assertIsNone(m.load_pending(state))
+            m.atomic_write(os.path.join(state, 'watch_until'), '1000')
+            still = m.process(fakes.mail_req(
+                state, op='watch', messages=[
+                    fakes.owner_msg('reply 1 See you Friday', seq='10', mid='e10'),
+                ]), runner=fakes.Runner(), now=1000)
+            self.assertEqual(still['reason'], 'watch_paused')
+            m.atomic_write(os.path.join(state, 'watch_until'), 'paused')
+            words = m.process(fakes.mail_req(
+                state, op='watch', messages=[
+                    fakes.owner_msg('reply 1 See you Friday', seq='11', mid='e11'),
+                ]), runner=fakes.Runner(), now=1000)
+            self.assertEqual(words['reason'], 'watch_paused')
+            m.atomic_write(os.path.join(state, 'watch_until'), '1001')
+            opened = m.process(fakes.mail_req(
+                state, op='watch', messages=[
+                    fakes.owner_msg('reply 1 See you Friday', seq='12', mid='e12'),
+                ]), runner=fakes.Runner(), now=1000)
+            self.assertEqual(opened['phase'], 'confirm')
+
+        with tempfile.TemporaryDirectory() as state:
+            copy = os.path.join(state, 'sender-juicebox.json')
+            with open(copy, 'w', encoding='utf-8') as fh:
+                fh.write('{"note": "not a real juicebox"}')
+            os.chmod(copy, 0o600)
+            outside = os.path.join(state, 'other-juicebox.json')
+            with open(outside, 'w', encoding='utf-8') as fh:
+                fh.write('{}')
+            m.process({'op': 'list_cards', 'state_dir': state})
+            self.assertFalse(os.path.exists(copy))
+            self.assertTrue(os.path.exists(outside))
+            with self.assertRaises(m.MailError) as caught:
+                m.process(fakes.mail_req(state, helper={
+                    'python': '/usr/bin/python3',
+                    'script': '/tmp/xchat_lite.py',
+                    'juicebox': outside,
+                }, payload=person('The March invoice is attached.')), runner=fakes.Runner(), now=1000)
+            self.assertEqual(caught.exception.code, 'bad_juicebox')
+            allowed = os.path.expanduser('~/xchat/sender/juicebox.json')
+            existed = os.path.exists(allowed)
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, helper={
+                'python': '/usr/bin/python3',
+                'script': '/tmp/xchat_lite.py',
+                'juicebox': allowed,
+            }, payload=person('The March invoice is attached. Please pay it by Friday.')),
+                runner=runner, now=1000)
+            self.assertEqual(res['action'], 'send')
+            argv = runner.calls[0][0]
+            self.assertIn('--juicebox', argv)
+            self.assertIn(os.path.realpath(allowed), argv)
+            self.assertNotIn(outside, argv)
+            self.assertFalse(os.path.exists(os.path.join(state, 'sender-juicebox.json')))
+            self.assertEqual(os.path.exists(allowed), existed)
+
+    def test_startup_removes_leftover_request_files(self):
+        with tempfile.TemporaryDirectory() as state:
+            kept = os.path.join(state, 'config.json')
+            leftover_in = os.path.join(state, 'in-old.json')
+            leftover_watch = os.path.join(state, 'watch-old.json')
+            other = os.path.join(state, 'notes.json')
+            live = os.path.join(state, 'in-live.json')
+            for path, text in (
+                (kept, '{"mailMode": "important"}'),
+                (leftover_in, '{"payload": {"text": "ZXQ-BODY-TOKEN"}}'),
+                (leftover_watch, '{"events": [{"text": "ZXQ-BODY-TOKEN"}]}'),
+                (other, '{"keep": true}'),
+            ):
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(text)
+                os.chmod(path, 0o600)
+            m.process({'op': 'list_cards', 'state_dir': state})
+            self.assertFalse(os.path.exists(leftover_in))
+            self.assertFalse(os.path.exists(leftover_watch))
+            self.assertTrue(os.path.exists(kept))
+            self.assertTrue(os.path.exists(other))
+            self.assertNotIn('ZXQ-BODY-TOKEN', fakes.tree_text(state))
+
+            with open(live, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'payload': {
+                        'id': 'msg_live',
+                        'from_name': 'News',
+                        'from_addr': 'noreply@news.example',
+                        'subject': 'Weekly',
+                        'text': 'Unsubscribe from this newsletter. ZXQ-BODY-TOKEN',
+                    },
+                }, fh)
+            os.chmod(live, 0o600)
+            with open(leftover_in, 'w', encoding='utf-8') as fh:
+                fh.write('{"payload": {"text": "ZXQ-BODY-TOKEN"}}')
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = m.main(['--in', live, '--state-dir', state])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(live))
+            self.assertFalse(os.path.exists(leftover_in))
+            self.assertIn('normal', buf.getvalue())
+            self.assertNotIn('ZXQ-BODY-TOKEN', buf.getvalue())
+            self.assertNotIn('ZXQ-BODY-TOKEN', fakes.tree_text(state))
 
     def test_command_line_deletes_the_request_and_hides_the_body(self):
         with tempfile.TemporaryDirectory() as state:
@@ -535,6 +713,7 @@ class ModeTests(unittest.TestCase):
                     },
                 ],
             }))
+            m.atomic_write(os.path.join(state, 'watch_until'), '9999999999')
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = m.main(['--in', watch, '--watch', '--state-dir', state])

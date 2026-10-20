@@ -5,6 +5,7 @@
   "owner_user_id": "",
   "sender_user_id": "",
   "agent_id": "",
+  "gmail_agent_id": "",
   "state_dir": "~/.xchat-mail",
   "helper": {
     "python": "",
