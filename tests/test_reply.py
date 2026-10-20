@@ -38,6 +38,11 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(posted['action'], 'confirm_posted')
         return res, runner
 
+    def answer(self, proposed, text='yes', seq='11', mid='yes-1', created=1050 * 1000):
+        return fakes.owner_msg(
+            text, seq=seq, mid=mid, created=created,
+            reply_to=proposed['sends'][0]['message_id'])
+
     def test_yes_and_no_words(self):
         for text in ('yes', 'YES', 'yes please', 'Yes!', 'yes.'):
             self.assertTrue(m.is_yes(text), text)
@@ -63,9 +68,9 @@ class ReplyTests(unittest.TestCase):
         self.assertNotIn(fakes.REPLY_TOKEN, json.dumps(res))
 
     def test_yes_inside_the_window_emits_one_effect(self):
-        self.propose(fakes.REPLY_TOKEN)
+        proposed, _runner = self.propose(fakes.REPLY_TOKEN)
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1050)
         self.assertEqual(res['phase'], 'approved')
         self.assertEqual(res['effect']['action'], 'send_email_reply')
@@ -77,7 +82,7 @@ class ReplyTests(unittest.TestCase):
         self.assertNotIn(fakes.REPLY_TOKEN, runner.texts()[0])
         self.assertEqual(m.load_pending(self.state)['phase'], 'awaiting_ack')
         again, _runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1060)
         self.assertEqual(again['reason'], 'awaiting_ack')
         self.assertNotIn('effect', again)
@@ -87,20 +92,45 @@ class ReplyTests(unittest.TestCase):
         self.assertIn(fakes.REPLY_TOKEN, pending_text)
         self.assertNotIn(fakes.REPLY_TOKEN, fakes.tree_text(self.state).replace(pending_text, ''))
 
-    def test_yes_at_120_seconds_counts(self):
-        self.propose()
+    def test_effect_uses_the_address_saved_on_pending(self):
+        proposed, _runner = self.propose(fakes.REPLY_TOKEN)
+        book = m.load_cards(self.state)
+        book['cards']['1']['from_addr'] = 'casey@example.com'
+        book['cards']['1']['from_name'] = 'Casey Boone'
+        m.save_cards(self.state, book)
         res, runner = self.watch([
-            fakes.owner_msg('yes please', seq='11', mid='yes-120', created=1120 * 1000),
+            self.answer(proposed, seq='11', mid='yes-freeze', created=1050 * 1000),
+        ], now=1050)
+        self.assertEqual(res['phase'], 'approved')
+        self.assertEqual(res['effect']['to'], 'jane@x.com')
+        self.assertEqual(res['effect']['reply_to'], 'msg_1')
+        self.assertNotIn('casey@example.com', json.dumps(res))
+        self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
+        self.assertEqual(m.load_pending(self.state)['to'], 'jane@x.com')
+
+    def test_yes_at_120_seconds_counts(self):
+        proposed, _runner = self.propose()
+        res, runner = self.watch([
+            self.answer(proposed, text='yes please', seq='11', mid='yes-120', created=1120 * 1000),
         ], now=1120)
         self.assertEqual(res['phase'], 'approved')
         self.assertIn('effect', res)
         self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
 
+    def test_yes_inside_the_window_counts_when_the_poll_is_late(self):
+        proposed, _runner = self.propose()
+        res, runner = self.watch([
+            self.answer(proposed, seq='11', mid='yes-edge', created=1120 * 1000),
+        ], now=1121)
+        self.assertEqual(res['phase'], 'approved')
+        self.assertIn('effect', res)
+        self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
+
     def test_late_yes_posts_too_late_and_does_not_emit(self):
-        self.propose()
+        proposed, _runner = self.propose()
         runner = fakes.Runner()
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='12', mid='yes-121', created=1121 * 1000),
+            self.answer(proposed, seq='12', mid='yes-121', created=1121 * 1000),
         ], now=1121, runner=runner)
         self.assertEqual(res['phase'], 'expired')
         self.assertNotIn('effect', res)
@@ -108,9 +138,21 @@ class ReplyTests(unittest.TestCase):
         self.assertIsNone(m.load_pending(self.state))
 
     def test_no_cancels_and_a_bare_yes_does_nothing(self):
-        self.propose()
+        proposed, _runner = self.propose()
         res, runner = self.watch([
-            fakes.owner_msg('nope', seq='12', mid='no-1', created=1060 * 1000),
+            fakes.owner_msg('yes', seq='13', mid='yes-bare', created=1040 * 1000),
+        ], now=1040)
+        self.assertEqual(res['reason'], 'quiet')
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+        res, runner = self.watch([
+            fakes.owner_msg('nope', seq='14', mid='no-bare', created=1050 * 1000),
+        ], now=1050)
+        self.assertEqual(res['reason'], 'quiet')
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+        res, runner = self.watch([
+            self.answer(proposed, text='nope', seq='12', mid='no-1', created=1060 * 1000),
         ], now=1060)
         self.assertEqual(res['phase'], 'cancelled')
         self.assertNotIn('effect', res)
@@ -118,31 +160,33 @@ class ReplyTests(unittest.TestCase):
         self.assertIsNone(m.load_pending(self.state))
 
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='13', mid='yes-bare', created=1070 * 1000),
+            fakes.owner_msg('yes', seq='15', mid='yes-after', created=1070 * 1000),
         ], now=1070)
         self.assertEqual(res['reason'], 'quiet')
         self.assertEqual(runner.calls, [])
 
     def test_yes_in_the_proposal_batch_cannot_approve(self):
+        runner = fakes.Runner()
         res, _runner = self.watch([
             fakes.owner_msg('reply 1 See you Friday', seq='10', mid='e10', created=1000 * 1000),
-            fakes.owner_msg('yes', seq='11', mid='yes-early', created=1001 * 1000),
-        ], now=1000)
+            fakes.owner_msg('yes', seq='11', mid='yes-early', created=1000 * 1000, reply_to='mid-1'),
+        ], now=1000, runner=runner)
         self.assertEqual(res['phase'], 'confirm')
+        self.assertEqual(res['sends'][0]['message_id'], 'mid-1')
         self.assertNotIn('effect', res)
         m.process({'op': 'confirm_posted', 'state_dir': self.state, 'confirm_id': res['confirm_id']},
-                  now=1005)
+                  now=1000)
         seen = m.load_seen_events(self.state)
         m.unsee_event(seen, '11')
         m.unsee_event(seen, 'yes-early')
         m.save_seen_events(self.state, seen)
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-early', created=1001 * 1000),
+            fakes.owner_msg('yes', seq='11', mid='yes-early', created=1000 * 1000, reply_to='mid-1'),
         ], now=1020)
         self.assertNotIn('effect', res)
         self.assertNotEqual(res.get('phase'), 'approved')
         fresh, fresh_runner = self.watch([
-            fakes.owner_msg('yes', seq='12', mid='yes-new', created=1030 * 1000),
+            fakes.owner_msg('yes', seq='12', mid='yes-new', created=1030 * 1000, reply_to='mid-1'),
         ], now=1030)
         self.assertEqual(fresh['phase'], 'approved')
         self.assertEqual(fresh_runner.texts()[0], '→ Jane Doe ✉️ sent')
@@ -171,17 +215,113 @@ class ReplyTests(unittest.TestCase):
         self.assertNotIn('effect', res)
         self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
         pending = m.load_pending(self.state)
-        opened = int(pending['confirm_at']) * 1000 - 2000
-        self.assertTrue(m.fresh_yes(
-            {'sequence_id': '15', 'id': 'edge2', 'created_at_msec': opened}, pending))
+        opened = int(pending['confirm_at']) * 1000
         self.assertFalse(m.fresh_yes(
-            {'sequence_id': '16', 'id': 'edge3', 'created_at_msec': opened - 1}, pending))
+            {'sequence_id': '14', 'id': 'edge0', 'created_at_msec': opened - 2000}, pending))
+        self.assertFalse(m.fresh_yes(
+            {'sequence_id': '15', 'id': 'edge1', 'created_at_msec': opened - 1}, pending))
+        self.assertTrue(m.fresh_yes(
+            {'sequence_id': '16', 'id': 'edge2', 'created_at_msec': opened}, pending))
+        self.assertFalse(m.in_yes_window(
+            {'sequence_id': '18', 'id': 'edge4', 'created_at_msec': opened - 1}, pending))
+        self.assertTrue(m.in_yes_window(
+            {'sequence_id': '19', 'id': 'edge5', 'created_at_msec': opened}, pending))
+        self.assertTrue(m.in_yes_window(
+            {'sequence_id': '20', 'id': 'edge6',
+             'created_at_msec': opened + m.YES_WINDOW_S * 1000}, pending))
+        self.assertFalse(m.in_yes_window(
+            {'sequence_id': '21', 'id': 'edge7',
+             'created_at_msec': opened + m.YES_WINDOW_S * 1000 + 1}, pending))
+
+    def test_bare_early_and_unrelated_yes_do_not_approve(self):
+        proposed, _runner = self.propose(fakes.REPLY_TOKEN)
+        mid = proposed['sends'][0]['message_id']
+        self.assertIn(mid, m.load_pending(self.state)['confirm_message_ids'])
+        res, runner = self.watch([
+            fakes.owner_msg('yes', seq='11', mid='bare', created=1050 * 1000),
+        ], now=1050)
+        self.assertNotIn('effect', res)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+        res, runner = self.watch([
+            fakes.owner_msg('yes please', seq='12', mid='early', created=1000 * 1000 - 2000, reply_to=mid),
+        ], now=1000)
+        self.assertNotIn('effect', res)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+        res, runner = self.watch([
+            fakes.owner_msg('yes', seq='13', mid='card-yes', created=1060 * 1000, reply_to='card-mid-1'),
+        ], now=1060)
+        self.assertNotIn('effect', res)
+        res, runner = self.watch([
+            fakes.owner_msg('yes', seq='14', mid='other', created=1070 * 1000, reply_to='relay-mid'),
+        ], now=1070)
+        self.assertNotIn('effect', res)
+        self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
+        res, runner = self.watch([
+            fakes.owner_msg('yes', seq='15', mid='edge', created=1000 * 1000, reply_to=mid),
+        ], now=1000)
+        self.assertEqual(res['phase'], 'approved')
+        self.assertEqual(res['effect']['text'], fakes.REPLY_TOKEN)
+        self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
+
+    def test_native_reply_to_the_confirm_sequence_approves(self):
+        proposed, _runner = self.propose()
+        mid = proposed['sends'][0]['message_id']
+        res, runner = self.watch([
+            {
+                'text': 'confirm',
+                'status': 'verified',
+                'event': {
+                    'type': 'Message', 'sequence_id': '70', 'id': mid,
+                    'sender_id': 'sender-1', 'conversation_id': '111:222',
+                    'created_at_msec': 1010 * 1000,
+                    'content': {'content_type': 'Text'},
+                },
+            },
+            {
+                'text': 'yes',
+                'status': 'verified',
+                'event': {
+                    'type': 'Message', 'sequence_id': '71', 'id': 'yes-seq',
+                    'sender_id': 'owner-1', 'conversation_id': '111:222',
+                    'created_at_msec': 1080 * 1000,
+                    'content': {
+                        'content_type': 'Text',
+                        'replying_to_preview': {'replying_to_message_sequence_id': '70'},
+                    },
+                },
+            },
+        ], now=1080)
+        self.assertEqual(res['phase'], 'approved')
+        self.assertEqual(runner.texts()[0], '→ Jane Doe ✉️ sent')
+        self.assertIn('70', m.load_pending(self.state)['confirm_sequence_ids'])
+
+    def test_reply_to_the_first_confirm_message_id_after_reencrypt(self):
+        runner = fakes.Runner()
+        res, runner = self.watch([
+            fakes.owner_msg('reply 1 See you Friday', seq='10', mid='e10', created=1000 * 1000),
+        ], now=1000, runner=runner)
+        first = res['sends'][0]['message_id']
+        again, runner = self.watch([], now=1005, runner=runner)
+        second = again['sends'][0]['message_id']
+        self.assertNotEqual(first, second)
+        self.assertEqual(again['confirm_id'], res['confirm_id'])
+        self.assertEqual(m.load_pending(self.state)['confirm_message_ids'], [first, second])
+        m.process(
+            {'op': 'confirm_posted', 'state_dir': self.state, 'confirm_id': res['confirm_id']},
+            now=1005)
+        approved, _runner = self.watch([
+            fakes.owner_msg('yes', seq='11', mid='yes-first', created=1060 * 1000, reply_to=first),
+        ], now=1060)
+        self.assertEqual(approved['phase'], 'approved')
+        self.assertIn('effect', approved)
 
     def test_encrypt_failure_does_not_consume_the_yes(self):
-        self.propose(fakes.REPLY_TOKEN)
+        proposed, _runner = self.propose(fakes.REPLY_TOKEN)
         runner = fakes.Runner(fail=True)
         res, _runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1050, runner=runner)
         self.assertEqual(res['action'], 'error')
         self.assertEqual(res['reason'], 'xchat_lite_failed')
@@ -191,21 +331,21 @@ class ReplyTests(unittest.TestCase):
         seen = m.load_seen_events(self.state)
         self.assertNotIn('yes-1', seen['ids'])
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1060)
         self.assertEqual(res['phase'], 'approved')
         self.assertEqual(res['effect']['text'], fakes.REPLY_TOKEN)
 
     def test_release_lets_the_same_yes_count_again(self):
-        self.propose(fakes.REPLY_TOKEN)
+        proposed, _runner = self.propose(fakes.REPLY_TOKEN)
         self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1050)
         released = m.process({'op': 'release_reply', 'state_dir': self.state}, now=1060)
         self.assertEqual(released['action'], 'released')
         self.assertEqual(m.load_pending(self.state)['phase'], 'posted')
         res, _runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1070)
         self.assertEqual(res['phase'], 'approved')
         self.assertEqual(res['effect']['text'], fakes.REPLY_TOKEN)
@@ -369,9 +509,9 @@ class ReplyTests(unittest.TestCase):
         book = m.load_cards(self.state)
         book['cards']['1']['source'] = 'agent'
         m.save_cards(self.state, book)
-        self.propose()
+        proposed, _runner = self.propose()
         res, runner = self.watch([
-            fakes.owner_msg('yes', seq='11', mid='yes-1', created=1050 * 1000),
+            self.answer(proposed, seq='11', mid='yes-1', created=1050 * 1000),
         ], now=1050, mailSource='agent')
         self.assertEqual(res['effect']['action'], 'handoff_reply')
         self.assertEqual(res['effect']['agent'], 'mail-lead')

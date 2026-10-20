@@ -109,22 +109,27 @@ class CardTests(unittest.TestCase):
     def test_subject_codes_are_masked_and_body_links_are_not_copied(self):
         with tempfile.TemporaryDirectory() as state:
             runner = fakes.Runner()
-            m.process(fakes.mail_req(state, payload={
+            res = m.process(fakes.mail_req(state, payload={
                 'id': 'msg_9',
                 'from_name': 'Jane Doe',
                 'from_addr': 'jane@x.com',
                 'subject': 'Login code 482913',
                 'text': 'Your verification code is 482913. ' + ('x' * 80) + ' room 1204 is free.',
                 'link': 'https://evil.example/secretpath',
+                'attachments': ['482913.txt'],
             }), runner=runner, now=1000)
+            self.assertTrue(res.get('suspicious'))
             card = runner.texts()[0]
             self.assertNotIn('482913', card)
+            self.assertNotIn('1204', card)
             self.assertIn('\u2022' * 6, card)
-            self.assertIn('1204', card)
+            self.assertIn('The body was withheld.', card)
             self.assertNotIn('Open:', card)
             self.assertNotIn('evil.example', card)
             self.assertNotIn('http', card)
-            self.assertTrue(card.startswith('✉️ Jane Doe · Login code '))
+            self.assertNotIn('📎', card)
+            self.assertTrue(card.startswith('⚠️ Jane Doe · suspicious: Login code '))
+            self.assertNotIn('482913', m.load_cards(state)['cards']['1']['subject'])
 
     def test_body_token_reaches_stdin_only(self):
         with tempfile.TemporaryDirectory() as state:

@@ -137,6 +137,20 @@ class CleanerTests(unittest.TestCase):
         self.assertNotIn('482913', masked)
         self.assertIn('1204', masked)
         self.assertIn('\u2022' * 6, masked)
+        self.assertEqual(m.mask_codes('code 123 456'), 'code ' + '\u2022' * 7)
+        self.assertEqual(m.mask_codes('pin 12 34 56'), 'pin ' + '\u2022' * 8)
+        self.assertEqual(m.mask_codes('code 1234-5678'), 'code ' + '\u2022' * 9)
+        self.assertEqual(m.mask_codes('otp AB12CD'), 'otp ' + '\u2022' * 6)
+        self.assertEqual(m.mask_codes('code X7K2-9Q'), 'code ' + '\u2022' * 7)
+        self.assertEqual(m.mask_codes('code Friday'), 'code Friday')
+        self.assertIn('9876', m.mask_codes('shopping 9876'))
+        # The word is in the other field. The code is in this one.
+        self.assertNotIn('123456', m.mask_codes('123456', prefix='verification code'))
+        self.assertNotIn('482913', m.mask_codes('482913', suffix='Your verification code is below'))
+        self.assertNotIn('123 456', m.mask_codes('Hello 123 456', prefix='Your code is'))
+        self.assertIn(
+            '482913',
+            m.mask_codes('482913', suffix=('y' * 50) + ' verification code'))
 
 
 if __name__ == '__main__':

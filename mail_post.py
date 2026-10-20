@@ -48,6 +48,7 @@ OWN_TEXT_CAP = 200_000
 REPLY_TEXT_CAP = 2000
 CONFIRM_SHOW_CAP = 180
 CODE_WINDOW = 48
+CODE_WITHHELD = 'Verification code. The body was withheld.'
 SEEN_EVENT_CAP = 500
 KNOWN_ID_CAP = 200
 
@@ -91,6 +92,11 @@ _SUSPICIOUS = (
 _CODE_WORD = re.compile(
     r'(?i)\b(?:codes?|otp|passcodes?|verify|verification|verifying|2fa|mfa|one-time|onetime|pin)\b')
 _CODE_NUM = re.compile(r'(?<!\d)(\d{4,8})(?!\d)')
+# "123 456", "12 34 56", "1234-5678", "123.456". Groups stay short so a sentence is not one match.
+_CODE_SPACED = re.compile(r'(?<!\d)(\d{1,7}(?:[ .\-]+\d{1,7}){1,7})(?!\d)')
+# "AB12CD" and "X7K2-9Q". A hyphen form is first so it is not cut into two tokens.
+_CODE_ALNUM = re.compile(
+    r'(?<![A-Za-z0-9])([A-Za-z0-9]{1,6}-[A-Za-z0-9]{1,6}|[A-Za-z0-9]{4,8})(?![A-Za-z0-9])')
 _URL = re.compile(r'(?i)\b(?:https?://|mailto:|www\.)\S+')
 _LONG_BARE = re.compile(r'(?i)\b[\w.-]+\.[a-z]{2,}/\S{8,}')
 _ZW = re.compile(r'[\u200b-\u200d\ufeff\u2060]')
@@ -398,24 +404,89 @@ def clean_display(text):
     return text.strip()
 
 
-def mask_codes(text):
-    """Mask a 4–8 digit code that sits near a code or verify word. Other numbers stay."""
-    if not text or not _CODE_WORD.search(text):
-        return text or ''
-    spans = [(m.start(), m.end()) for m in _CODE_WORD.finditer(text)]
+def _near_code_word(start, end, spans):
+    for a, b in spans:
+        if start <= b + CODE_WINDOW and end >= a - CODE_WINDOW:
+            return True
+    return False
 
-    def near(start, end):
-        for a, b in spans:
-            if start <= b + CODE_WINDOW and end >= a - CODE_WINDOW:
-                return True
+
+def _spaced_digits(token):
+    parts = re.split(r'[ .\-]+', token)
+    if len(parts) < 2 or any(not part.isdigit() for part in parts):
+        return 0
+    total = sum(len(part) for part in parts)
+    if 4 <= total <= 8:
+        return total
+    return 0
+
+
+def _alnum_code(token):
+    if token.count('-') > 1:
         return False
+    raw = token.replace('-', '')
+    if not 4 <= len(raw) <= 8 or raw.isdigit():
+        return False
+    return any(ch.isalpha() for ch in raw) and any(ch.isdigit() for ch in raw)
 
-    def repl(m):
-        if near(m.start(), m.end()):
-            return '\u2022' * len(m.group(1))
-        return m.group(0)
 
-    return _CODE_NUM.sub(repl, text)
+def _part_of_spaced_run(text, start, end):
+    """A 4–8 digit slice of a longer spaced run is not its own code."""
+    if re.search(r'\d[ .\-]+$', text[:start] or ''):
+        return True
+    if re.match(r'[ .\-]+\d', text[end:] or ''):
+        return True
+    return False
+
+
+def mask_codes(text, prefix='', suffix=''):
+    """Mask a code near a code word in this text or in the other field.
+
+    prefix is the subject when masking the body. suffix is the body when
+    masking the subject. A word on one side covers a code on the other.
+    Digits, spaced digits, and alphanumeric tokens all count. Other numbers stay.
+    """
+    if not text:
+        return text or ''
+    pre = (prefix + '\n') if prefix else ''
+    suf = ('\n' + suffix) if suffix else ''
+    combined = pre + text + suf
+    if not _CODE_WORD.search(combined):
+        return text
+    spans = [(m.start(), m.end()) for m in _CODE_WORD.finditer(combined)]
+    base = len(pre)
+
+    def near(match):
+        return _near_code_word(base + match.start(), base + match.end(), spans)
+
+    def sub_spaced(match):
+        if _spaced_digits(match.group(1)) and near(match):
+            return '\u2022' * len(match.group(1))
+        return match.group(0)
+
+    def sub_alnum(match):
+        if _alnum_code(match.group(1)) and near(match):
+            return '\u2022' * len(match.group(1))
+        return match.group(0)
+
+    def sub_num(match):
+        if _part_of_spaced_run(text, match.start(), match.end()):
+            return match.group(0)
+        if near(match):
+            return '\u2022' * len(match.group(1))
+        return match.group(0)
+
+    text = _CODE_SPACED.sub(sub_spaced, text)
+    text = _CODE_ALNUM.sub(sub_alnum, text)
+    return _CODE_NUM.sub(sub_num, text)
+
+
+def is_code_mail(text):
+    """Verification wording, or a real code next to a code word."""
+    if _VERIFY.search(text or ''):
+        return True
+    body = text or ''
+    return mask_codes(body) != body
 
 
 def split_sentences(text):
@@ -678,15 +749,18 @@ def merge_payload(payload, source):
     d_plain = clean_display(new_part(plain_ex))
     d_html = clean_display(new_part(html_ex)) if html_ex else ''
     display = d_plain if _letter_count(d_plain) >= _letter_count(d_html) else d_html
-    display = mask_codes(display)
     data['from_addr'] = clean_addr(data.get('from_addr') or '')
     name = one_line(data.get('from_name') or '', 80).replace('<', '').replace('>', '')
     data['_given_name'] = name
     data['from_name'] = name or (data['from_addr'].split('@', 1)[0] if data['from_addr'] else 'someone')
-    subject = mask_codes(_strip_urls(one_line(data.get('subject') or '', 120))).replace('<', '').replace('>', '')
-    data['subject'] = subject or '(no subject)'
-    data['_scan'] = _squash_ws(scan)
-    data['_display'] = display
+    # Mask across both fields. A subject of "verification code" must hide 123456 in the body,
+    # and a code that sits in the subject must see a word that sits in the body.
+    scan_flat = _squash_ws(scan)
+    raw_subject = _strip_urls(one_line(data.get('subject') or '', 120)).replace('<', '').replace('>', '').strip()
+    data['_code_mail'] = is_code_mail(raw_subject + '\n' + scan_flat)
+    data['subject'] = mask_codes(raw_subject, suffix=scan_flat) or '(no subject)'
+    data['_scan'] = scan_flat
+    data['_display'] = mask_codes(display, prefix=raw_subject)
     data['_files'] = attachment_names(data.get('attachments'))
     reply_to = str(data.get('message_id') or data.get('reply_to') or data.get('id') or '').strip()
     reply_to = one_line(reply_to, 200)
@@ -754,6 +828,18 @@ def build_effect(card, text, source, agent_id):
         'to': card['from_addr'],
         'text': text,
     }
+
+
+def confirmed_card(card, pending):
+    """Reply to the address saved on pending.json, not a card rewritten later."""
+    frozen = dict(card)
+    if pending.get('to'):
+        frozen['from_addr'] = pending['to']
+    if pending.get('from_name'):
+        frozen['from_name'] = pending['from_name']
+    if pending.get('reply_to'):
+        frozen['reply_to'] = pending['reply_to']
+    return frozen
 
 
 # ---------- state files (mode 600, no bodies) ----------
@@ -962,6 +1048,55 @@ def clear_pending(state):
         pass
 
 
+def _outbox_path(state):
+    return os.path.join(state, 'outbox.json')
+
+
+def load_outbox(state):
+    data = read_json(_outbox_path(state), {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_outbox(state, data):
+    path = _outbox_path(state)
+    if not data:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    atomic_write(path, json.dumps(data))
+
+
+def outbox_get(state, email_id):
+    row = load_outbox(state).get(email_id)
+    if not isinstance(row, dict):
+        return None
+    result = row.get('result')
+    if not isinstance(result, dict) or not result.get('sends'):
+        return None
+    return result
+
+
+def outbox_put(state, email_id, result):
+    # Ciphertext only. The plaintext card never goes in this file.
+    data = load_outbox(state)
+    data[str(email_id)] = {'result': result}
+    save_outbox(state, data)
+
+
+def outbox_drop(state, email_ids):
+    data = load_outbox(state)
+    changed = False
+    for email_id in email_ids or []:
+        email_id = str(email_id or '')
+        if email_id and email_id in data:
+            del data[email_id]
+            changed = True
+    if changed:
+        save_outbox(state, data)
+
+
 def load_seen_events(state):
     data = read_json(_events_path(state), {'ids': []})
     if not isinstance(data, dict) or not isinstance(data.get('ids'), list):
@@ -1165,14 +1300,10 @@ def apply_config(req):
     return merged
 
 
-def _now(req, now):
+def _now(_req, now):
+    # The request file must not set the clock. Tests pass `now`; the command line uses time.time().
     if now is not None:
         return float(now)
-    if req.get('now') is not None:
-        try:
-            return float(req.get('now'))
-        except (TypeError, ValueError):
-            pass
     return time.time()
 
 
@@ -1195,8 +1326,7 @@ def _reserve_card(state, fields):
     data = load_cards(state)
     for card in data['cards'].values():
         if card.get('email_id') == fields['email_id']:
-            card.update(fields)
-            save_cards(state, data)
+            # A second inbound must not replace the address frozen with the first ciphertext.
             return card
     n = int(data.get('next') or 1)
     fields = dict(fields)
@@ -1207,17 +1337,25 @@ def _reserve_card(state, fields):
     return fields
 
 
+def _public_reason(reason, data):
+    public = safe_public_reason(reason) or 'Flagged as suspicious. The body was withheld.'
+    public = mask_codes(public, prefix=data.get('subject') or '', suffix=data.get('_scan') or '')
+    if not re.search(r'[A-Za-z]', public or ''):
+        return CODE_WITHHELD
+    return public
+
+
 def build_plaintext(data, source, tag, reason):
     open_link = safe_open_link(data.get('link'), source)
-    if tag == 'suspicious':
-        # `reason` is already the line to show. Do not fall back to the raw payload:
-        # an instruction upgrade must replace a mild agent reason.
-        public = safe_public_reason(reason) or 'Flagged as suspicious. The body was withheld.'
+    # An instruction and a verification code both stay off the card: no body, no file name, no link.
+    if tag == 'suspicious' or data.get('_code_mail'):
+        # Keep an instruction reason. A code with no instruction uses the fixed line.
+        public = _public_reason(reason, data) if tag == 'suspicious' else CODE_WITHHELD
         text = render_card(data['from_name'], data['subject'], [], [], None, True, public)
         return text, public
     lines = body_lines(data.get('_display') or '')
-    # Final pass: a URL must not survive inside a body line.
-    lines = [_strip_urls(mask_codes(line)).strip() for line in lines]
+    # Final pass: a URL must not survive inside a body line. The subject word still counts.
+    lines = [_strip_urls(mask_codes(line, prefix=data.get('subject') or '')).strip() for line in lines]
     lines = [line for line in lines if line]
     text = render_card(data['from_name'], data['subject'], lines, data.get('_files') or [], open_link, False, '')
     return text, ''
@@ -1242,6 +1380,10 @@ def handle_inbound(req, runner, now):
     if dedupe.seen(email_id):
         log_counts(state, duplicate=1)
         return {'action': 'skip', 'reason': 'duplicate', 'posted_kind': 'duplicate'}
+    # The lock is still held. A leased id already has its one ciphertext.
+    leased = outbox_get(state, email_id)
+    if leased:
+        return leased
 
     data = merge_payload(payload, source)
     forced = suspicious_reason((data.get('subject') or '') + '\n' + (data.get('_scan') or ''))
@@ -1263,6 +1405,12 @@ def handle_inbound(req, runner, now):
         tag, reason = _importance(data, data.get('_scan') or '')
         if forced:
             tag, reason = 'suspicious', forced
+    # Code mail is posted like suspicious mail: the body never reaches the card.
+    # Do this before the normal skip, or a noreply PIN would be dropped with its code unread
+    # and a later "all" mode would print it.
+    if data.get('_code_mail') and tag != 'suspicious':
+        tag = 'suspicious'
+        reason = CODE_WITHHELD
     if tag == 'normal' and mode != 'all':
         dedupe.commit([email_id])
         log_counts(state, normal=1)
@@ -1314,8 +1462,6 @@ def handle_inbound(req, runner, now):
     supplied = bool((req.get('xchat') or {}).get('conversation_key_events') and
                     (req.get('xchat') or {}).get('signing_keys'))
     _save_keys(cache, conv, xchat, supplied)
-    if not req.get('defer_commit'):
-        dedupe.commit([email_id])
     log_key = 'suspicious' if posted_tag == 'suspicious' else ('normal' if posted_tag == 'normal' else 'important')
     log_counts(state, **{log_key: 1})
     result = {
@@ -1330,6 +1476,12 @@ def handle_inbound(req, runner, now):
     }
     if posted_tag == 'suspicious':
         result['suspicious'] = True
+    # Lease the id before this returns and the state lock drops. defer_commit waits for
+    # --ack to mark seen, so the lease is what stops a second inbound from encrypting again.
+    if req.get('defer_commit'):
+        outbox_put(state, email_id, result)
+    else:
+        dedupe.commit([email_id])
     return result
 
 
@@ -1354,6 +1506,7 @@ def normalize_watch_message(row):
         content = ev.get('content') or {}
         preview = content.get('replying_to_preview') or {}
         seq = preview.get('replying_to_message_sequence_id')
+        targets = _reply_targets(seq, preview.get('replying_to_message_id'))
         return {
             'sequence_id': '' if ev.get('sequence_id') is None else str(ev.get('sequence_id')),
             'id': '' if ev.get('id') is None else str(ev.get('id')),
@@ -1363,11 +1516,13 @@ def normalize_watch_message(row):
             'text': row.get('text') if isinstance(row.get('text'), str) else '',
             'status': row.get('status') or '',
             'reply_to_sequence_id': '' if not seq else str(seq),
+            'reply_targets': targets,
             'actionable': _actionable(content),
         }
     if 'text' not in row and 'sender_id' not in row:
         return None
     seq = row.get('reply_to_sequence_id')
+    targets = _reply_targets(seq, row.get('reply_to_message_id'))
     return {
         'sequence_id': '' if row.get('sequence_id') is None else str(row.get('sequence_id')),
         'id': '' if row.get('id') is None else str(row.get('id')),
@@ -1377,6 +1532,7 @@ def normalize_watch_message(row):
         'text': row.get('text') if isinstance(row.get('text'), str) else '',
         'status': row.get('status') or '',
         'reply_to_sequence_id': '' if not seq else str(seq),
+        'reply_targets': targets,
         'actionable': row.get('actionable', True) is not False,
     }
 
@@ -1451,8 +1607,17 @@ def resolve_card(intent, cards):
     return None, 'not_a_card'
 
 
+def _reply_targets(seq, message_id):
+    targets = []
+    for val in (seq, message_id):
+        val = '' if not val else str(val)
+        if val and val not in targets:
+            targets.append(val)
+    return targets
+
+
 def fresh_yes(message, pending):
-    """A yes counts only when it is a new event from after the confirm was shown."""
+    """A new event at or after confirm_at. Nothing from before the confirm counts."""
     keys = set(event_keys(message))
     if not keys:
         return False
@@ -1465,7 +1630,85 @@ def fresh_yes(message, pending):
     ts = message.get('created_at_msec')
     if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         return False
-    return ts >= int(float(confirm_at) * 1000) - 2000
+    return ts >= int(float(confirm_at) * 1000)
+
+
+def in_yes_window(message, pending):
+    """Inclusive [confirm_at, confirm_at + 120s]. A yes two seconds early does not count."""
+    if not fresh_yes(message, pending):
+        return False
+    ts = message.get('created_at_msec')
+    end = int((float(pending.get('confirm_at')) + YES_WINDOW_S) * 1000)
+    return ts <= end
+
+
+def _confirm_targets(pending):
+    allowed = []
+    for key in ('confirm_message_ids', 'confirm_sequence_ids'):
+        for item in pending.get(key) or []:
+            item = str(item or '').strip()
+            if item and item not in allowed:
+                allowed.append(item)
+    return allowed
+
+
+def replies_to_confirm(message, pending):
+    """Native Reply to this confirm. A bare yes in the shared DM does not count."""
+    targets = message.get('reply_targets')
+    if not isinstance(targets, list):
+        targets = []
+    cleaned = []
+    for item in list(targets) + [message.get('reply_to_sequence_id')]:
+        item = str(item or '').strip()
+        if item and item not in cleaned:
+            cleaned.append(item)
+    if not cleaned:
+        return False
+    allowed = set(_confirm_targets(pending))
+    return any(item in allowed for item in cleaned)
+
+
+def remember_confirm_send(pending, send):
+    """Keep every confirm message id. The first one is what the routine posts."""
+    mid = str((send or {}).get('message_id') or '').strip()
+    if not mid:
+        return False
+    ids = []
+    for item in pending.get('confirm_message_ids') or []:
+        item = str(item or '').strip()
+        if item and item not in ids:
+            ids.append(item)
+    if mid in ids or len(ids) >= 20:
+        return False
+    ids.append(mid)
+    pending['confirm_message_ids'] = ids
+    return True
+
+
+def bind_confirm_targets(pending, rows):
+    """A native Reply names a sequence id. Learn it from the confirm message id."""
+    mids = set()
+    for item in pending.get('confirm_message_ids') or []:
+        item = str(item or '').strip()
+        if item:
+            mids.add(item)
+    if not mids:
+        return False
+    seqs = []
+    for item in pending.get('confirm_sequence_ids') or []:
+        item = str(item or '').strip()
+        if item and item not in seqs:
+            seqs.append(item)
+    changed = False
+    for row in rows:
+        mid = str(row.get('id') or '')
+        seq = str(row.get('sequence_id') or '')
+        if mid in mids and seq and seq not in seqs:
+            seqs.append(seq)
+            changed = True
+    if changed:
+        pending['confirm_sequence_ids'] = seqs
+    return changed
 
 
 def _cap_ids(ids, cap=KNOWN_ID_CAP):
@@ -1655,33 +1898,49 @@ def handle_watch(req, runner, now):
         pending['known_ids'] = _cap_ids(list(pending.get('known_ids') or []) + batch_keys)
         save_pending(state, pending)
         card = book['cards'].get(str(pending.get('card_n')))
-        if not card or not card.get('from_addr'):
+        if not card:
             clear_pending(state)
             finish_seen()
             return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
-        line = confirm_line(card['from_name'], card['from_addr'], pending.get('text') or '')
+        frozen = confirmed_card(card, pending)
+        if not frozen.get('from_addr'):
+            clear_pending(state)
+            finish_seen()
+            return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
+        line = confirm_line(frozen['from_name'], frozen['from_addr'], pending.get('text') or '')
         send, err = _fixed_send(
             req, runner, line, xchat, from_cache, cache, conv,
             thread_of(pending.get('owner_sequence_id')), 'watch')
         if err:
             return err
+        remember_confirm_send(pending, send)
+        save_pending(state, pending)
         finish_seen()
         return {'action': 'send', 'phase': 'confirm', 'sends': [send],
                 'confirm_id': pending.get('confirm_id'), 'card_n': card['n'],
                 'encrypted': True, 'posted_kind': 'watch'}
 
     if pending and pending.get('phase') == 'posted':
+        if bind_confirm_targets(pending, rows):
+            save_pending(state, pending)
         confirm_at = float(pending.get('confirm_at') or 0)
-        if not confirm_at or now > confirm_at + YES_WINDOW_S:
+        closed = (not confirm_at) or now > confirm_at + YES_WINDOW_S
+        if closed:
             late = None
+            kept = False
             for row in new_rows:
                 if not speakable(row):
                     continue
                 text = row.get('text') or ''
-                if (is_yes(text) or is_no(text)) and fresh_yes(row, pending):
-                    late = row
+                if (not (is_yes(text) or is_no(text)) or not replies_to_confirm(row, pending)
+                        or not fresh_yes(row, pending)):
+                    continue
+                if in_yes_window(row, pending):
+                    kept = True
                     break
-            if late is not None:
+                late = row
+                break
+            if not kept and late is not None:
                 # Keys are required to say the window closed. Leave the pending in place until then.
                 if is_no(late.get('text') or ''):
                     line, phase, log_key = 'Not sent.', 'cancelled', 'reply_cancelled'
@@ -1695,16 +1954,19 @@ def handle_watch(req, runner, now):
                 log_counts(state, **{log_key: 1})
                 return {'action': 'send', 'phase': phase, 'sends': [send], 'encrypted': True,
                         'posted_kind': 'watch'}
-            clear_pending(state)
-            pending = None
-            log_counts(state, reply_expired=1)
+            if not kept:
+                clear_pending(state)
+                pending = None
+                log_counts(state, reply_expired=1)
 
     for row in new_rows:
         if not speakable(row):
             continue
         text = row.get('text') or ''
         if pending and pending.get('phase') == 'posted':
-            if not (is_yes(text) or is_no(text)) or not fresh_yes(row, pending):
+            # This DM is shared with iMessage Relay. A bare yes never counts.
+            if (not (is_yes(text) or is_no(text)) or not replies_to_confirm(row, pending)
+                    or not in_yes_window(row, pending)):
                 continue
             if is_no(text):
                 send, err = send_fixed('Not sent.', row.get('sequence_id'))
@@ -1720,11 +1982,12 @@ def handle_watch(req, runner, now):
                 finish_seen()
                 clear_pending(state)
                 return {'action': 'skip', 'reason': 'unknown_card', 'posted_kind': 'watch'}
-            effect = build_effect(card, pending.get('text') or '', source, agent_id)
+            frozen = confirmed_card(card, pending)
+            effect = build_effect(frozen, pending.get('text') or '', source, agent_id)
             effect_id = 'e_' + uuid.uuid4().hex[:12]
             effect['effect_id'] = effect_id
             # Encrypt first. A failure must leave the yes unseen and the confirm posted.
-            send, err = send_fixed(sent_line(card['from_name'], source), row.get('sequence_id'))
+            send, err = send_fixed(sent_line(frozen['from_name'], source), row.get('sequence_id'))
             if err:
                 return err
             pending['phase'] = 'awaiting_ack'
@@ -1773,7 +2036,7 @@ def handle_watch(req, runner, now):
         if err:
             return err
         confirm_id = 'c_' + uuid.uuid4().hex[:12]
-        save_pending(state, {
+        pending_row = {
             'confirm_id': confirm_id,
             'card_n': card['n'],
             'from_name': card['from_name'],
@@ -1786,7 +2049,10 @@ def handle_watch(req, runner, now):
             'known_ids': _cap_ids(batch_keys),
             'owner_sequence_id': seq or '',
             'source': source,
-        })
+            'confirm_message_ids': [],
+        }
+        remember_confirm_send(pending_row, send)
+        save_pending(state, pending_row)
         finish_seen()
         return {'action': 'send', 'phase': 'confirm', 'sends': [send], 'confirm_id': confirm_id,
                 'card_n': card['n'], 'encrypted': True, 'posted_kind': 'watch'}
@@ -1867,6 +2133,7 @@ def drop_card(req, n):
     email_id = book['cards'][key].get('email_id')
     del book['cards'][key]
     save_cards(state, book)
+    outbox_drop(state, [email_id])
     return {'action': 'dropped', 'n': int(n), 'email_id': email_id}
 
 
@@ -1890,6 +2157,7 @@ def ack(req, now):
     dedupe = Dedupe(path, req.get('ttl_seconds', 7 * 86400), now=lambda: now)
     ids = [str(i) for i in (req.get('ids') or []) if i]
     dedupe.commit(ids)
+    outbox_drop(state, ids)
     return {'action': 'ack', 'remembered': len(ids)}
 
 
@@ -1921,6 +2189,35 @@ def process(req, runner=None, now=None):
 
 
 # ---------- CLI ----------
+def request_from_file(data):
+    """The model writes this file while it can see the mail.
+
+    Keep the mail, the encoded events, the key material, and defer_commit.
+    Helper, owner, sender, conversation, agent, clock, and op come from
+    config.json, time.time(), and the command line.
+    """
+    if not isinstance(data, dict):
+        raise MailError('bad_payload')
+    out = {}
+    if 'payload' in data:
+        if not isinstance(data['payload'], dict):
+            raise MailError('bad_payload')
+        out['payload'] = data['payload']
+    if 'events' in data:
+        if not isinstance(data['events'], list):
+            raise MailError('bad_payload')
+        out['events'] = data['events']
+    if 'xchat' in data:
+        if not isinstance(data['xchat'], dict):
+            raise MailError('bad_payload')
+        out['xchat'] = data['xchat']
+    if 'defer_commit' in data:
+        if not isinstance(data['defer_commit'], bool):
+            raise MailError('bad_payload')
+        out['defer_commit'] = data['defer_commit']
+    return out
+
+
 def _read_request(path):
     """Read a request file and delete it immediately. The body is in this file."""
     if not path:
@@ -2010,7 +2307,7 @@ def main(argv=None):
         elif args.drop_card is not None and not args.infile:
             req = {'op': 'drop_card', 'n': args.drop_card}
         else:
-            req = _read_request(args.infile)
+            req = request_from_file(_read_request(args.infile))
             if args.payload_file:
                 req['payload'] = _read_payload_file(args.payload_file)
             if args.watch:

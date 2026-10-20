@@ -76,7 +76,7 @@ python3 -m unittest discover -s tests -v
 v0.1.0. `SHA256SUMS` is the checksum of `mail_post.py`:
 
 ```
-31e53f6326d6fcb9589d83e27cbf57d0e2d2746ba23570bc5478f1dc24694b0e  mail_post.py
+bfa085a33ee337cc884be6e46142e203c136d595add6ad777162e4c8a59c1f59  mail_post.py
 ```
 
 Check the file you install:

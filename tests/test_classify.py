@@ -117,6 +117,91 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(m._importance(data, data['_scan'])[0], 'suspicious')
         self.assertNotIn('ignore previous', data['_display'].lower())
 
+    def test_verification_and_code_mail_withhold_the_body(self):
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, payload={
+                'id': 'msg_v',
+                'from_name': 'Harbor Bank',
+                'from_addr': 'noreply@bank.example',
+                'subject': 'verification code',
+                'text': 'Hello Mina. 123456 is ready. Room 1204 is free. ZXQ-BODY-TOKEN',
+            }), runner=runner, now=1000)
+            self.assertEqual(res['action'], 'send')
+            self.assertTrue(res.get('suspicious'))
+            card = runner.texts()[0]
+            self.assertNotIn('123456', card)
+            self.assertNotIn('1204', card)
+            self.assertNotIn('ZXQ-BODY-TOKEN', card)
+            self.assertNotIn('Hello Mina', card)
+            self.assertIn(m.CODE_WITHHELD, card)
+            self.assertIn('verification code', card.lower())
+            self.assertNotIn('123456', m.load_cards(state)['cards']['1']['subject'])
+
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, payload={
+                'id': 'msg_s',
+                'from_name': 'Harbor Bank',
+                'from_addr': 'noreply@bank.example',
+                'subject': '482913',
+                'text': 'Your verification code is below.',
+            }), runner=runner, now=1000)
+            card = runner.texts()[0]
+            self.assertTrue(res.get('suspicious'))
+            self.assertNotIn('482913', card)
+            self.assertNotIn('below', card)
+            self.assertIn('\u2022' * 6, card)
+
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, payload={
+                'id': 'msg_p',
+                'from_name': 'Mina Cole',
+                'from_addr': 'mina@example.com',
+                'subject': 'Account notice',
+                'text': 'Your login code is 123 456. The gate code is AB12CD.',
+            }), runner=runner, now=1000)
+            card = runner.texts()[0]
+            self.assertTrue(res.get('suspicious'))
+            self.assertNotIn('123 456', card)
+            self.assertNotIn('123456', card)
+            self.assertNotIn('AB12CD', card)
+            self.assertNotIn('gate', card)
+            self.assertIn('Account notice', card)
+
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, mailSource='agent', payload={
+                'id': 'msg_a',
+                'from_name': 'Mina Cole',
+                'from_addr': 'mina@example.com',
+                'subject': 'Sign-in',
+                'tag': 'important',
+                'text': 'otp X7K2-9Q for Mina',
+                'link': 'https://mail.example/msg/18',
+            }), runner=runner, now=1000)
+            card = runner.texts()[0]
+            self.assertTrue(res.get('suspicious'))
+            self.assertNotIn('X7K2', card)
+            self.assertNotIn('9Q', card)
+            self.assertNotIn('Open:', card)
+            self.assertNotIn('Mina', card.split('\n', 1)[-1])
+
+        with tempfile.TemporaryDirectory() as state:
+            runner = fakes.Runner()
+            res = m.process(fakes.mail_req(state, payload={
+                'id': 'msg_r',
+                'from_name': 'Mina Cole',
+                'from_addr': 'mina@example.com',
+                'subject': 'Spare key',
+                'text': 'The spare key is in room 1204.',
+            }), runner=runner, now=1000)
+            self.assertEqual(res['action'], 'send')
+            self.assertFalse(res.get('suspicious'))
+            self.assertIn('1204', runner.texts()[0])
+            self.assertIn('spare key', runner.texts()[0])
+
     def test_pipeline_withholds_suspicious_body(self):
         with tempfile.TemporaryDirectory() as state:
             runner = fakes.Runner()
