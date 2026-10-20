@@ -1,0 +1,17 @@
+{
+  "mailSource": "own",
+  "mailMode": "important",
+  "conversation_id": "",
+  "owner_user_id": "",
+  "sender_user_id": "",
+  "agent_id": "",
+  "state_dir": "~/.xchat-mail",
+  "helper": {
+    "python": "",
+    "script": "",
+    "user_id": "",
+    "key_version": "",
+    "juicebox": "",
+    "xdg_config_home": "~/xchat/sender"
+  }
+}
